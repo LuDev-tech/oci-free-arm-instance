@@ -15,7 +15,7 @@ env:
   OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
-  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_KEY_B64: ${{ secrets.OCI_CLI_KEY_B64 }}
   SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
           pip install oci-cli
 
           mkdir -p ~/.oci
-          echo "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          printf '%s' "${{ secrets.OCI_CLI_KEY_B64 }}" | base64 --decode > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
 
           echo "[DEFAULT]" > ~/.oci/config
