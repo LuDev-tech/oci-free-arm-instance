@@ -1,20 +1,22 @@
 name: Try to Create OCI VM
-# It will run every 5 minutes.
+
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  # Allows you to manually run this workflow from the Actions tab
+    # Runs every 10 minutes — persistent retry
+    - cron: "*/10 * * * *"
   workflow_dispatch:
+
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
-  IMAGE_ID: "ocid1.image.oc1.ap-singapore-1.aaaaaaaa5a3xwkk5vaichk47fms2uzvsqeriats2uorf6kwgq3l3nwrbhipa"
+  IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
-  AD_NAME: "KClJ:AP-SINGAPORE-1-AD-1"
-  OCI_CLI_REGION: "ap-singapore-1"
+  AD_NAME: ${{ secrets.OCI_AD_NAME }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
   OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
 
 jobs:
   build-and-deploy:
@@ -32,8 +34,7 @@ jobs:
 
       - name: Setup OCI CLI and Try to Create VM
         id: create_vm
-        # This forces the job to succeed so the cache will save.
-        continue-on-error: true 
+        continue-on-error: true
         run: |
           set -o pipefail
 
@@ -48,49 +49,52 @@ jobs:
           echo "tenancy=${{ secrets.OCI_CLI_TENANCY }}" >> ~/.oci/config
           echo "fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}" >> ~/.oci/config
           echo "key_file=~/.oci/oci_api_key.pem" >> ~/.oci/config
-          echo "region=${{ env.OCI_CLI_REGION }}" >> ~/.oci/config
+          echo "region=${{ secrets.OCI_CLI_REGION }}" >> ~/.oci/config
+
           echo "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
 
-          # Run the command, capture ALL output, and use '|| true' to prevent the script from exiting early.
           OCI_OUTPUT=$(oci compute instance launch \
             --compartment-id "$COMPARTMENT_ID" \
             --availability-domain "$AD_NAME" \
             --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
             --subnet-id "$SUBNET_ID" \
             --image-id "$IMAGE_ID" \
             --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
             --assign-public-ip true \
-            --display-name "coolify-vm" \
-            --boot-volume-size-in-gbs 200 2>&1 || true)
+            --display-name "grvt-bot-arm" \
+            --wait-for-state RUNNING \
+            --max-wait-seconds 600 2>&1 || true)
 
-          # Store the log as a GitHub step output
           echo "log_data<<EOF" >> $GITHUB_OUTPUT
           echo "$OCI_OUTPUT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          # Check the log content for an error string.
-          if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-            echo "Success! 'PROVISIONING' state found in output."
+          echo "=== OCI OUTPUT ==="
+          echo "$OCI_OUTPUT"
+
+          if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "RUNNING"'; then
+            echo "Success! Instance is RUNNING."
             exit 0
+          elif echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+            echo "Instance PROVISIONING — will become RUNNING shortly."
+            exit 0
+          elif echo "$OCI_OUTPUT" | grep -qi "out of host capacity"; then
+            echo "Out of capacity — will retry in next run."
+            exit 1
+          elif echo "$OCI_OUTPUT" | grep -qi "TooManyRequests\|throttl"; then
+            echo "Rate limited — will retry in next run."
+            exit 1
           else
-            echo "Error: Success string not found in OCI output. Failing the step."
+            echo "Error: Unknown response. Check logs."
             exit 1
           fi
 
-      - name: Send Discord Notification
-        if: always()
-        uses: sarisia/actions-status-discord@v1.15.4
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          title: "OCI VM Status: ${{ steps.create_vm.outcome }}"
-          status: ${{ steps.create_vm.outcome }}
-          color: ${{ steps.create_vm.outcome == 'success' && '0x28a745' || '0xdc3545' }}
-          description: |
-            Attempt to create A1.Flex VM.
-            **Status:** `${{ steps.create_vm.outcome }}`
-
-            **Log Output:**
-            ```json
-            ${{ steps.create_vm.outputs.log_data }}
-            ```
+      - name: Report outcome
+        run: |
+          if [ "${{ steps.create_vm.outcome }}" = "success" ]; then
+            echo "✅ VM CREATED SUCCESSFULLY!"
+            echo "Instance is running in Oracle Cloud."
+          else
+            echo "❌ Attempt failed — will retry in 10 minutes."
+          fi
