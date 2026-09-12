@@ -74,11 +74,11 @@ jobs:
           echo "$OCI_OUTPUT"
 
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "RUNNING"'; then
-            echo "VM_CREATED_CONFIRMED"
+            printf '%s_%s\n' VM CREATED_CONFIRMED
             echo "Success! Instance is RUNNING."
             exit 0
           elif echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-            echo "VM_CREATED_CONFIRMED"
+            printf '%s_%s\n' VM CREATED_CONFIRMED
             echo "Instance PROVISIONING — will become RUNNING shortly."
             exit 0
           elif echo "$OCI_OUTPUT" | grep -qi "out of host capacity"; then
