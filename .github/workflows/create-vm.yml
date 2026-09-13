@@ -62,7 +62,7 @@ jobs:
             --image-id "$IMAGE_ID" \
             --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
             --assign-public-ip true \
-            --display-name "grvt-bot-arm" \
+            --display-name "oracle-arm-vps" \
             --wait-for-state RUNNING \
             --max-wait-seconds 600 2>&1 || true)
 
