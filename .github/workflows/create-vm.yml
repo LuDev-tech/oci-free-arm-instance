@@ -51,7 +51,6 @@ jobs:
           test -n "$COMPARTMENT_ID"
           test -n "$IMAGE_ID"
           test -n "$SUBNET_ID"
-          test -n "$AD_NAME"
           test -n "$OCI_CLI_USER"
           test -n "$OCI_CLI_TENANCY"
           test -n "$OCI_CLI_FINGERPRINT"
