@@ -18,7 +18,6 @@ env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
   IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
-  AD_NAME: ${{ secrets.OCI_AD_NAME }}
   OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
   OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
@@ -77,7 +76,33 @@ jobs:
           } > ~/.oci/config
           chmod 600 ~/.oci/config
           printf '%s\n' "$SSH_PUBLIC_KEY" > /home/runner/my_ssh_key.pub
-          oci iam availability-domain list --compartment-id "$COMPARTMENT_ID" --query "data[?name=='$AD_NAME'] | length(@)" --raw-output | grep -qx '1'
+
+      - name: Discover Available ADs
+        id: discover_ads
+        run: |
+          set -euo pipefail
+          # Query Oracle for all available Availability Domains
+          AD_JSON=$(oci iam availability-domain list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --query 'data[].name' \
+            --raw-output 2>/dev/null || echo "[]")
+
+          echo "Raw AD list: $AD_JSON"
+
+          # Convert to newline-separated list
+          ADS=$(echo "$AD_JSON" | jq -r '.[]' 2>/dev/null || echo "")
+
+          if [ -z "$ADS" ]; then
+            echo "AD discovery failed or no ADs found"
+            exit 1
+          fi
+
+          # Save to file for the next step
+          echo "$ADS" > /tmp/available_ads.txt
+          echo "Available ADs:"
+          cat /tmp/available_ads.txt
+          AD_COUNT=$(wc -l < /tmp/available_ads.txt)
+          echo "Total ADs: $AD_COUNT"
 
       - name: Retry ARM capacity every 5 minutes
         run: |
@@ -85,6 +110,11 @@ jobs:
           ATTEMPT=0
           START_EPOCH=$(date +%s)
           CHAIN_LIMIT_SECONDS=18000
+
+          # Load available ADs
+          ADS=$(cat /tmp/available_ads.txt)
+          AD_COUNT=$(echo "$ADS" | wc -l)
+          echo "Loaded $AD_COUNT ADs to try"
 
           start_next_run() {
             echo "Starting the next chained GitHub Actions run via REST API."
@@ -150,58 +180,70 @@ jobs:
               done
             fi
 
-            # Preserve the OCI CLI exit status.
-            set +e
-            OCI_OUTPUT=$(timeout 120s oci compute instance launch \
-              --compartment-id "$COMPARTMENT_ID" \
-              --availability-domain "$AD_NAME" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              --subnet-id "$SUBNET_ID" \
-              --image-id "$IMAGE_ID" \
-              --ssh-authorized-keys-file /home/runner/my_ssh_key.pub \
-              --assign-public-ip true \
-              --display-name "oracle-arm-vps" \
-              --output json 2>&1)
-            LAUNCH_RC=$?
-            set -e
-            echo "$OCI_OUTPUT"
+            # Try each AD in sequence
+            LAUNCH_SUCCESS=0
+            for AD in $ADS; do
+              echo ""
+              echo "--- Trying AD: $AD ---"
 
-            INSTANCE_ID=$(printf '%s' "$OCI_OUTPUT" | jq -r '.data.id // empty' 2>/dev/null || true)
-            if [ -n "$INSTANCE_ID" ]; then
-              echo "Launch accepted: $INSTANCE_ID"
-              for poll in $(seq 1 20); do
-                INSTANCE_JSON=$(timeout 60s oci compute instance get --instance-id "$INSTANCE_ID" --output json 2>&1 || true)
-                STATE=$(printf '%s' "$INSTANCE_JSON" | jq -r '.data["lifecycle-state"] // empty' 2>/dev/null || true)
-                echo "Instance state: $STATE"
-                if [ "$STATE" = "RUNNING" ]; then
-                  printf '%s_%s\n' VM CREATED_CONFIRMED
-                  echo "Verified oracle-arm-vps is RUNNING: $INSTANCE_ID"
-                  exit 0
+              # Preserve the OCI CLI exit status.
+              set +e
+              OCI_OUTPUT=$(timeout 120s oci compute instance launch \
+                --compartment-id "$COMPARTMENT_ID" \
+                --availability-domain "$AD" \
+                --shape "VM.Standard.A1.Flex" \
+                --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+                --subnet-id "$SUBNET_ID" \
+                --image-id "$IMAGE_ID" \
+                --ssh-authorized-keys-file /home/runner/my_ssh_key.pub \
+                --assign-public-ip true \
+                --display-name "oracle-arm-vps" \
+                --output json 2>&1)
+              LAUNCH_RC=$?
+              set -e
+              echo "$OCI_OUTPUT"
+
+              INSTANCE_ID=$(printf '%s' "$OCI_OUTPUT" | jq -r '.data.id // empty' 2>/dev/null || true)
+              if [ -n "$INSTANCE_ID" ]; then
+                echo "Launch accepted in AD $AD: $INSTANCE_ID"
+                for poll in $(seq 1 20); do
+                  INSTANCE_JSON=$(timeout 60s oci compute instance get --instance-id "$INSTANCE_ID" --output json 2>&1 || true)
+                  STATE=$(printf '%s' "$INSTANCE_JSON" | jq -r '.data["lifecycle-state"] // empty' 2>/dev/null || true)
+                  echo "Instance state: $STATE"
+                  if [ "$STATE" = "RUNNING" ]; then
+                    printf '%s_%s\n' VM CREATED_CONFIRMED
+                    echo "Verified oracle-arm-vps is RUNNING: $INSTANCE_ID (AD: $AD)"
+                    LAUNCH_SUCCESS=1
+                    break 2
+                  fi
+                  if [ "$STATE" = "TERMINATED" ] || [ "$STATE" = "TERMINATING" ]; then
+                    echo "Launch reached terminal failure state; trying next AD."
+                    break
+                  fi
+                  sleep 30
+                done
+                if [ "$LAUNCH_SUCCESS" -eq 0 ]; then
+                  echo "Instance did not reach RUNNING; trying next AD."
                 fi
-                if [ "$STATE" = "TERMINATED" ] || [ "$STATE" = "TERMINATING" ]; then
-                  echo "Launch reached terminal failure state; reconciling before retry."
-                  break
-                fi
-                sleep 30
-              done
-              sleep 300
-              continue
+              elif echo "$OCI_OUTPUT" | grep -qi 'out of host capacity'; then
+                echo "Out of capacity in AD $AD. Trying next AD..."
+                continue
+              elif echo "$OCI_OUTPUT" | grep -qi 'TooManyRequests\|throttl'; then
+                echo "Rate limited in AD $AD. Waiting 60 seconds..."
+                sleep 60
+                continue
+              else
+                echo "Error in AD $AD. Trying next AD..."
+                continue
+              fi
+            done
+
+            if [ "$LAUNCH_SUCCESS" -eq 1 ]; then
+              exit 0
             fi
 
-            if echo "$OCI_OUTPUT" | grep -qi 'out of host capacity'; then
-              echo "Capacity unavailable. Waiting 300 seconds."
-              sleep 300
-            elif echo "$OCI_OUTPUT" | grep -qi 'TooManyRequests\|throttl'; then
-              echo "Rate limited. Waiting 600 seconds."
-              sleep 600
-            elif [ "$LAUNCH_RC" -ne 0 ] && echo "$OCI_OUTPUT" | grep -qi 'InternalError\|ServiceUnavailable\|timeout\|connection'; then
-              echo "Transient OCI error. Waiting 900 seconds after reconciliation."
-              sleep 900
-            else
-              echo "Non-retryable or unrecognized OCI error; stopping instead of looping blindly."
-              exit 1
-            fi
+            echo "All ADs failed for this attempt. Waiting 300 seconds."
+            sleep 300
           done
 
       - name: Report
